@@ -60,11 +60,5 @@ FKSeriesTypeDefinition = Annotated[
     int,
     mapped_column(ForeignKey("series_type_definition.id", ondelete="RESTRICT")),
 ]
-FKPerformanceEvent = Annotated[
-    UUID,
-    mapped_column(ForeignKey("performance_event.id", ondelete="CASCADE"))
-]
-FKMetricDefinition = Annotated[
-    UUID,
-    mapped_column(ForeignKey("performance_metric_definition.id", ondelete="CASCADE"))
-]
+FKPerformanceEvent = Annotated[UUID, mapped_column(ForeignKey("performance_event.id", ondelete="CASCADE"))]
+FKMetricDefinition = Annotated[UUID, mapped_column(ForeignKey("performance_metric_definition.id", ondelete="CASCADE"))]
