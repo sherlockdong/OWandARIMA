@@ -431,6 +431,156 @@ class Whoop247Data(Base247DataTemplate):
             db.commit()
         return count
 
+    # -------------------------------------------------------------------------
+    # Physiological Cycle Data
+    # -------------------------------------------------------------------------
+
+    def get_cycle_data(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> list[dict[str, Any]]:
+        """Fetch physiological cycles from the Whoop v2 API."""
+        all_cycle_data: list[dict[str, Any]] = []
+        next_token = None
+        max_limit = 25
+
+        start_iso = start_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_iso = end_time.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        while True:
+            params: dict[str, Any] = {
+                "start": start_iso,
+                "end": end_iso,
+                "limit": max_limit,
+            }
+            if next_token:
+                params["nextToken"] = next_token
+
+            try:
+                response = self._make_api_request(
+                    db,
+                    user_id,
+                    "/v2/cycle",
+                    params=params,
+                )
+                store_raw_payload(
+                    source="api_response",
+                    provider="whoop",
+                    payload=response,
+                    user_id=str(user_id),
+                    trace_id="/v2/cycle",
+                )
+
+                records = response.get("records", []) if isinstance(response, dict) else []
+                all_cycle_data.extend(records)
+
+                next_token = response.get("next_token") if isinstance(response, dict) else None
+                if not records or not next_token:
+                    break
+            except Exception as e:
+                log_structured(
+                    self.logger,
+                    "error",
+                    f"Error fetching Whoop cycle data: {e}",
+                    provider="whoop",
+                    task="get_cycle_data",
+                    user_id=str(user_id),
+                )
+                if all_cycle_data:
+                    log_structured(
+                        self.logger,
+                        "warning",
+                        f"Returning partial cycle data due to error: {e}",
+                        provider="whoop",
+                        task="get_cycle_data",
+                        user_id=str(user_id),
+                    )
+                    break
+                raise
+
+        return all_cycle_data
+
+    def _normalize_cycle_health_score(
+        self,
+        raw_cycle: dict[str, Any],
+        user_id: UUID,
+    ) -> HealthScoreCreate | None:
+        """Convert a scored Whoop physiological cycle into daily strain."""
+        if raw_cycle.get("score_state") != "SCORED":
+            return None
+
+        score = raw_cycle.get("score") or {}
+        strain = score.get("strain")
+        start = raw_cycle.get("start")
+
+        if strain is None or start is None:
+            return None
+
+        try:
+            recorded_at = datetime.fromisoformat(
+                start.replace("Z", "+00:00"),
+            )
+        except (ValueError, AttributeError):
+            return None
+
+        components = {
+            key: ScoreComponent(value=value)
+            for key, value in {
+                "kilojoule": score.get("kilojoule"),
+                "average_heart_rate": score.get("average_heart_rate"),
+                "max_heart_rate": score.get("max_heart_rate"),
+            }.items()
+            if value is not None
+        }
+
+        return HealthScoreCreate(
+            id=uuid4(),
+            user_id=user_id,
+            provider=ProviderName.WHOOP,
+            category=HealthScoreCategory.STRAIN,
+            value=strain,
+            qualifier="cycle",
+            recorded_at=recorded_at,
+            zone_offset=raw_cycle.get("timezone_offset"),
+            components=components or None,
+        )
+
+    def load_and_save_cycles(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> int:
+        """Fetch and save scored Whoop physiological cycles."""
+        raw_data = self.get_cycle_data(
+            db,
+            user_id,
+            start_time,
+            end_time,
+        )
+
+        cycle_scores = [
+            score
+            for raw_cycle in raw_data
+            if (
+                score := self._normalize_cycle_health_score(
+                    raw_cycle,
+                    user_id,
+                )
+            )
+            is not None
+        ]
+
+        if cycle_scores:
+            health_score_service.bulk_create(db, cycle_scores)
+            db.commit()
+
+        return len(cycle_scores)
+
     def load_and_save_all(
         self,
         db: DbSession,
@@ -461,6 +611,7 @@ class Whoop247Data(Base247DataTemplate):
 
         results = {
             "sleep_sessions_synced": 0,
+            "cycle_samples_synced": 0,
             "recovery_samples_synced": 0,
             "activity_samples_synced": 0,
             "body_measurement_samples_synced": 0,
@@ -474,6 +625,24 @@ class Whoop247Data(Base247DataTemplate):
                 self.logger,
                 "error",
                 f"Failed to sync sleep data: {e}",
+                provider="whoop",
+                task="load_and_save_all",
+                user_id=str(user_id),
+            )
+
+        try:
+            results["cycle_samples_synced"] = self.load_and_save_cycles(
+                db,
+                user_id,
+                start_time,
+                end_time,
+            )
+        except Exception as e:
+            db.rollback()
+            log_structured(
+                self.logger,
+                "error",
+                f"Failed to sync cycle data: {e}",
                 provider="whoop",
                 task="load_and_save_all",
                 user_id=str(user_id),

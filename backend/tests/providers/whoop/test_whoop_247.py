@@ -1,5 +1,6 @@
 """Tests for WHOOP 24/7 data normalization."""
 
+from datetime import datetime, timezone
 from uuid import uuid4
 
 import pytest
@@ -68,3 +69,112 @@ class TestWhoopSleepNormalization:
         assert normalized["duration_seconds"] == 28_800
         assert normalized["efficiency_percent"] == pytest.approx(93.75)
         assert normalized["is_nap"] is False
+
+
+class TestWhoopCycleNormalization:
+    @pytest.fixture
+    def data_247(self) -> Whoop247Data:
+        return WhoopStrategy().data_247
+
+    @pytest.fixture
+    def raw_cycle(self) -> dict:
+        return {
+            "id": 93845,
+            "user_id": 10129,
+            "created_at": "2026-07-05T12:00:00.000Z",
+            "updated_at": "2026-07-05T12:15:00.000Z",
+            "start": "2026-07-05T11:00:00.000Z",
+            "end": "2026-07-06T10:30:00.000Z",
+            "timezone_offset": "-04:00",
+            "score_state": "SCORED",
+            "score": {
+                "strain": 14.275,
+                "kilojoule": 8_288.297,
+                "average_heart_rate": 68,
+                "max_heart_rate": 141,
+            },
+        }
+
+    def test_normalize_cycle_creates_daily_strain(
+        self,
+        data_247: Whoop247Data,
+        raw_cycle: dict,
+    ) -> None:
+        health_score = data_247._normalize_cycle_health_score(
+            raw_cycle,
+            uuid4(),
+        )
+
+        assert health_score is not None
+        assert health_score.value == pytest.approx(14.275)
+        assert health_score.qualifier == "cycle"
+        assert health_score.zone_offset == "-04:00"
+        assert health_score.recorded_at == datetime(
+            2026,
+            7,
+            5,
+            11,
+            tzinfo=timezone.utc,
+        )
+        assert health_score.components is not None
+        assert health_score.components["average_heart_rate"].value == 68
+        assert health_score.components["max_heart_rate"].value == 141
+
+    def test_normalize_cycle_skips_unscored_cycle(
+        self,
+        data_247: Whoop247Data,
+        raw_cycle: dict,
+    ) -> None:
+        raw_cycle["score_state"] = "PENDING"
+
+        assert (
+            data_247._normalize_cycle_health_score(
+                raw_cycle,
+                uuid4(),
+            )
+            is None
+        )
+
+    def test_load_and_save_all_includes_cycle_sync(
+        self,
+        data_247: Whoop247Data,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            data_247,
+            "load_and_save_sleep",
+            lambda *_args, **_kwargs: 1,
+        )
+        monkeypatch.setattr(
+            data_247,
+            "load_and_save_cycles",
+            lambda *_args, **_kwargs: 2,
+        )
+        monkeypatch.setattr(
+            data_247,
+            "load_and_save_recovery",
+            lambda *_args, **_kwargs: 3,
+        )
+        monkeypatch.setattr(
+            data_247,
+            "load_and_save_body_measurement",
+            lambda *_args, **_kwargs: 4,
+        )
+
+        start = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        end = datetime(2026, 7, 6, tzinfo=timezone.utc)
+
+        result = data_247.load_and_save_all(
+            object(),
+            uuid4(),
+            start,
+            end,
+        )
+
+        assert result == {
+            "sleep_sessions_synced": 1,
+            "cycle_samples_synced": 2,
+            "recovery_samples_synced": 3,
+            "activity_samples_synced": 0,
+            "body_measurement_samples_synced": 4,
+        }
