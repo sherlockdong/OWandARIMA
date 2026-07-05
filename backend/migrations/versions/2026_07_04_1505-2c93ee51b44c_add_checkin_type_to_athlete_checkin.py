@@ -4,9 +4,8 @@ Revision ID: 2c93ee51b44c
 Revises: 7a8a0828fece
 """
 
-from alembic import op
 import sqlalchemy as sa
-
+from alembic import op
 
 revision: str = "2c93ee51b44c"
 down_revision: str | None = "7a8a0828fece"
