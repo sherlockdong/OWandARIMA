@@ -1,6 +1,7 @@
 """Tests for WHOOP 24/7 data normalization."""
 
 from datetime import datetime, timezone
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
@@ -178,3 +179,128 @@ class TestWhoopCycleNormalization:
             "activity_samples_synced": 0,
             "body_measurement_samples_synced": 4,
         }
+
+
+class TestWhoopRecoveryNormalization:
+    @pytest.fixture
+    def data_247(self) -> Whoop247Data:
+        return WhoopStrategy().data_247
+
+    @pytest.fixture
+    def raw_recovery(self) -> dict:
+        return {
+            "cycle_id": 93845,
+            "sleep_id": "27f70d06-4f31-4d89-ae8d-62d7bed0876a",
+            "user_id": 10129,
+            "created_at": "2026-07-05T11:15:00.000Z",
+            "updated_at": "2026-07-05T11:20:00.000Z",
+            "score_state": "SCORED",
+            "score": {
+                "recovery_score": 82,
+                "resting_heart_rate": 49,
+                "hrv_rmssd_milli": 61.25,
+                "spo2_percentage": 97.2,
+                "skin_temp_celsius": 33.8,
+            },
+        }
+
+    def test_normalize_recovery_preserves_sleep_context(
+        self,
+        data_247: Whoop247Data,
+        raw_recovery: dict,
+    ) -> None:
+        user_id = uuid4()
+        sleep_record_id = uuid4()
+        data_source_id = uuid4()
+
+        normalized, health_score = data_247.normalize_recovery(
+            raw_recovery,
+            user_id,
+            zone_offset="-04:00",
+            sleep_record_id=sleep_record_id,
+            data_source_id=data_source_id,
+        )
+
+        assert normalized["zone_offset"] == "-04:00"
+        assert normalized["sleep_record_id"] == sleep_record_id
+        assert health_score is not None
+        assert health_score.zone_offset == "-04:00"
+        assert health_score.sleep_record_id == sleep_record_id
+        assert health_score.data_source_id == data_source_id
+        assert health_score.components is not None
+        assert health_score.components["hrv_rmssd_milli"].value == pytest.approx(61.25)
+
+    def test_get_recovery_record_uses_cycle_endpoint(
+        self,
+        data_247: Whoop247Data,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        captured: dict[str, str] = {}
+
+        def fake_request(
+            _db: object,
+            _user_id: object,
+            endpoint: str,
+            **_kwargs: object,
+        ) -> dict:
+            captured["endpoint"] = endpoint
+            return {"cycle_id": 93845}
+
+        monkeypatch.setattr(
+            data_247,
+            "_make_api_request",
+            fake_request,
+        )
+        monkeypatch.setattr(
+            "app.services.providers.whoop.data_247.store_raw_payload",
+            lambda **_kwargs: None,
+        )
+
+        result = data_247.get_recovery_record(
+            object(),
+            uuid4(),
+            "93845",
+        )
+
+        assert result == {"cycle_id": 93845}
+        assert captured["endpoint"] == "/v2/cycle/93845/recovery"
+
+    def test_save_recovery_propagates_offsets_to_all_samples(
+        self,
+        data_247: Whoop247Data,
+        raw_recovery: dict,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        normalized, _ = data_247.normalize_recovery(
+            raw_recovery,
+            uuid4(),
+            zone_offset="-04:00",
+            sleep_record_id=uuid4(),
+            data_source_id=uuid4(),
+        )
+        captured: list = []
+
+        def fake_bulk_create(
+            _db: object,
+            samples: list,
+        ) -> int:
+            captured.extend(samples)
+            return len(samples)
+
+        monkeypatch.setattr(
+            "app.services.providers.whoop.data_247.timeseries_service.bulk_create_samples",
+            fake_bulk_create,
+        )
+
+        db = MagicMock()
+        count = data_247.save_recovery_data(
+            db,
+            normalized["user_id"],
+            normalized,
+        )
+
+        assert count == 4
+        assert len(captured) == 4
+        assert all(sample.zone_offset == "-04:00" for sample in captured)
+        assert all(sample.external_id is not None for sample in captured)
+        db.commit.assert_called_once()

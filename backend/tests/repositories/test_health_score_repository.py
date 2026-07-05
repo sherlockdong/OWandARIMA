@@ -6,7 +6,7 @@ Tests cover:
 - get_with_filters: category, provider, date range, user scoping
 - get_latest_by_category
 - get_latest_per_category
-- bulk_create with on_conflict_do_nothing
+- bulk_create with idempotent conflict updates
 """
 
 from datetime import datetime, timedelta, timezone
@@ -19,8 +19,17 @@ from sqlalchemy.orm import Session
 from app.models import HealthScore
 from app.repositories.health_score_repository import HealthScoreRepository
 from app.schemas.enums import HealthScoreCategory, ProviderName
-from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams
-from tests.factories import DataSourceFactory, HealthScoreFactory, UserFactory
+from app.schemas.model_crud.activities import (
+    HealthScoreCreate,
+    HealthScoreQueryParams,
+    ScoreComponent,
+)
+from tests.factories import (
+    DataSourceFactory,
+    EventRecordFactory,
+    HealthScoreFactory,
+    UserFactory,
+)
 
 
 @pytest.fixture
@@ -200,7 +209,7 @@ class TestHealthScoreRepositoryBulkCreate:
         results = db.query(HealthScore).filter(HealthScore.data_source_id == data_source.id).all()
         assert len(results) == 3
 
-    def test_bulk_create_ignores_duplicates(self, db: Session, repo: HealthScoreRepository) -> None:
+    def test_bulk_create_updates_duplicates(self, db: Session, repo: HealthScoreRepository) -> None:
         data_source = DataSourceFactory()
         recorded_at = datetime.now(timezone.utc)
         original = HealthScoreCreate(
@@ -229,4 +238,162 @@ class TestHealthScoreRepositoryBulkCreate:
 
         results = db.query(HealthScore).filter(HealthScore.data_source_id == data_source.id).all()
         assert len(results) == 1
-        assert results[0].value == Decimal("80.00")
+        assert results[0].value == Decimal("99.00")
+
+
+class TestHealthScoreRepositoryUpsertLinks:
+    def test_bulk_create_refreshes_existing_provider_score(
+        self,
+        db: Session,
+        repo: HealthScoreRepository,
+    ) -> None:
+        user = UserFactory()
+        data_source = DataSourceFactory(
+            user=user,
+            provider=ProviderName.WHOOP,
+            source="whoop",
+        )
+        sleep_record = EventRecordFactory(
+            data_source=data_source,
+            category="sleep",
+            type="sleep_session",
+            external_id=str(uuid4()),
+            zone_offset="-04:00",
+        )
+        recorded_at = datetime(
+            2026,
+            7,
+            5,
+            11,
+            tzinfo=timezone.utc,
+        )
+
+        repo.bulk_create(
+            db,
+            [
+                HealthScoreCreate(
+                    id=uuid4(),
+                    user_id=user.id,
+                    data_source_id=data_source.id,
+                    provider=ProviderName.WHOOP,
+                    category=HealthScoreCategory.RECOVERY,
+                    value=70,
+                    recorded_at=recorded_at,
+                    components={
+                        "hrv_rmssd_milli": ScoreComponent(
+                            value=50,
+                        ),
+                    },
+                )
+            ],
+        )
+        db.commit()
+
+        repo.bulk_create(
+            db,
+            [
+                HealthScoreCreate(
+                    id=uuid4(),
+                    user_id=user.id,
+                    data_source_id=data_source.id,
+                    provider=ProviderName.WHOOP,
+                    category=HealthScoreCategory.RECOVERY,
+                    value=82,
+                    recorded_at=recorded_at,
+                    zone_offset="-04:00",
+                    sleep_record_id=sleep_record.id,
+                    components={
+                        "hrv_rmssd_milli": ScoreComponent(
+                            value=61.25,
+                        ),
+                    },
+                )
+            ],
+        )
+        db.commit()
+
+        rows = (
+            db.query(HealthScore)
+            .filter(
+                HealthScore.user_id == user.id,
+                HealthScore.provider == ProviderName.WHOOP,
+                HealthScore.category == HealthScoreCategory.RECOVERY,
+                HealthScore.recorded_at == recorded_at,
+            )
+            .all()
+        )
+
+        assert len(rows) == 1
+        assert rows[0].value == Decimal("82.00")
+        assert rows[0].zone_offset == "-04:00"
+        assert rows[0].sleep_record_id == sleep_record.id
+        assert rows[0].components["hrv_rmssd_milli"]["value"] == 61.25
+
+    def test_sleep_and_recovery_can_share_sleep_record(
+        self,
+        db: Session,
+        repo: HealthScoreRepository,
+    ) -> None:
+        user = UserFactory()
+        data_source = DataSourceFactory(
+            user=user,
+            provider=ProviderName.WHOOP,
+            source="whoop",
+        )
+        sleep_record = EventRecordFactory(
+            data_source=data_source,
+            category="sleep",
+            type="sleep_session",
+            external_id=str(uuid4()),
+            zone_offset="-04:00",
+        )
+        recorded_at = datetime(
+            2026,
+            7,
+            5,
+            11,
+            tzinfo=timezone.utc,
+        )
+
+        repo.bulk_create(
+            db,
+            [
+                HealthScoreCreate(
+                    id=uuid4(),
+                    user_id=user.id,
+                    data_source_id=data_source.id,
+                    provider=ProviderName.WHOOP,
+                    category=HealthScoreCategory.SLEEP,
+                    value=88,
+                    recorded_at=recorded_at,
+                    zone_offset="-04:00",
+                    sleep_record_id=sleep_record.id,
+                ),
+                HealthScoreCreate(
+                    id=uuid4(),
+                    user_id=user.id,
+                    data_source_id=data_source.id,
+                    provider=ProviderName.WHOOP,
+                    category=HealthScoreCategory.RECOVERY,
+                    value=82,
+                    recorded_at=recorded_at,
+                    zone_offset="-04:00",
+                    sleep_record_id=sleep_record.id,
+                ),
+            ],
+        )
+        db.commit()
+
+        rows = (
+            db.query(HealthScore)
+            .filter(
+                HealthScore.sleep_record_id == sleep_record.id,
+            )
+            .all()
+        )
+
+        assert len(rows) == 2
+        assert {row.category for row in rows} == {
+            HealthScoreCategory.SLEEP,
+            HealthScoreCategory.RECOVERY,
+        }

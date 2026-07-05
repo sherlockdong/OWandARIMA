@@ -48,13 +48,33 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
         return results, total_count
 
     def bulk_create(self, db_session: DbSession, creators: list[HealthScoreCreate]) -> None:
-        """Bulk insert health scores, doing nothing on conflict with the unique constraint."""
+        """Insert or refresh health scores using their provider-time identity."""
         if not creators:
             return
 
-        values = [c.model_dump() for c in creators]
+        deduped: dict[tuple, dict] = {}
+        for creator in creators:
+            value = creator.model_dump()
+            key = (
+                creator.user_id,
+                creator.provider,
+                creator.category,
+                creator.recorded_at,
+            )
+            deduped[key] = value
 
-        stmt = insert(HealthScore).values(values).on_conflict_do_nothing()
+        stmt = insert(HealthScore).values(list(deduped.values()))
+        stmt = stmt.on_conflict_do_update(
+            constraint="uq_health_score_user_provider_category_time",
+            set_={
+                "data_source_id": stmt.excluded.data_source_id,
+                "value": stmt.excluded.value,
+                "qualifier": stmt.excluded.qualifier,
+                "zone_offset": stmt.excluded.zone_offset,
+                "components": stmt.excluded.components,
+                "sleep_record_id": stmt.excluded.sleep_record_id,
+            },
+        )
         db_session.execute(stmt)
         # Caller is responsible for commit — allows batching with other operations
 
