@@ -40,6 +40,9 @@ from app.config import settings
 from app.database import DbSession
 from app.repositories import UserConnectionRepository
 from app.schemas.providers.whoop import WhoopWebhookNotification, WhoopWebhookNotificationType
+from app.services.athlete_daily_feature_service import (
+    athlete_daily_feature_service,
+)
 from app.services.providers.templates.base_webhook_handler import BaseWebhookHandler
 from app.services.providers.whoop.data_247 import Whoop247Data
 from app.services.providers.whoop.workouts import WhoopWorkouts
@@ -229,6 +232,29 @@ class WhoopWebhookHandler(BaseWebhookHandler):
     # Per-event-type handlers
     # ------------------------------------------------------------------
 
+    def _rebuild_daily_features_for_sleep_resource(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        sleep_resource_id: str,
+    ) -> int:
+        sleep_record = self.data_247.event_record_repo.get_by_external_id(
+            db,
+            user_id,
+            sleep_resource_id,
+            source="whoop",
+        )
+        if sleep_record is None:
+            return 0
+
+        rows = athlete_daily_feature_service.rebuild_for_source_window(
+            db,
+            user_id,
+            sleep_record.end_datetime,
+            sleep_record.end_datetime,
+        )
+        return len(rows)
+
     def _handle_updated(
         self,
         db: DbSession,
@@ -236,16 +262,56 @@ class WhoopWebhookHandler(BaseWebhookHandler):
         user_id: UUID,
         resource_id: str,
     ) -> dict[str, Any]:
-        """Fetch the specific resource from the Whoop API and save it."""
+        """Fetch a WHOOP resource, save it, and refresh affected features."""
         match event_type:
             case WhoopWebhookNotificationType.WORKOUT_UPDATED:
-                count = self.workouts.load_single_workout(db, user_id, resource_id)
+                count = self.workouts.load_single_workout(
+                    db,
+                    user_id,
+                    resource_id,
+                )
             case WhoopWebhookNotificationType.SLEEP_UPDATED:
-                count = self.data_247.load_single_sleep(db, user_id, resource_id)
+                count = self.data_247.load_single_sleep(
+                    db,
+                    user_id,
+                    resource_id,
+                )
             case WhoopWebhookNotificationType.RECOVERY_UPDATED:
-                count = self.data_247.load_single_recovery(db, user_id, resource_id)
+                count = self.data_247.load_single_recovery(
+                    db,
+                    user_id,
+                    resource_id,
+                )
             case _:
-                return {"status": "ignored", "reason": f"unhandled_event_type: {event_type}"}
+                return {
+                    "status": "ignored",
+                    "reason": (f"unhandled_event_type: {event_type}"),
+                }
+
+        daily_features_rebuilt = 0
+        if count and event_type in {
+            WhoopWebhookNotificationType.SLEEP_UPDATED,
+            WhoopWebhookNotificationType.RECOVERY_UPDATED,
+        }:
+            try:
+                daily_features_rebuilt = self._rebuild_daily_features_for_sleep_resource(
+                    db,
+                    user_id,
+                    resource_id,
+                )
+            except Exception as feature_error:
+                db.rollback()
+                log_structured(
+                    logger,
+                    "warning",
+                    ("WHOOP webhook data was saved but daily feature rebuilding failed"),
+                    provider="whoop",
+                    action="whoop_daily_feature_rebuild_failed",
+                    user_id=str(user_id),
+                    event_type=event_type,
+                    resource_id=resource_id,
+                    error=str(feature_error),
+                )
 
         log_structured(
             logger,
@@ -256,8 +322,14 @@ class WhoopWebhookHandler(BaseWebhookHandler):
             user_id=str(user_id),
             event_type=event_type,
             records_saved=count,
+            daily_features_rebuilt=daily_features_rebuilt,
         )
-        return {"status": "processed", "event_type": event_type, "records_saved": count}
+        return {
+            "status": "processed",
+            "event_type": event_type,
+            "records_saved": count,
+            "daily_features_rebuilt": daily_features_rebuilt,
+        }
 
     def _handle_deleted(
         self,
