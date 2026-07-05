@@ -243,7 +243,9 @@ class WhoopWorkouts(BaseWorkoutsTemplate):
             provider=ProviderName.WHOOP,
             category=HealthScoreCategory.STRAIN,
             value=score.strain,
+            qualifier="workout",
             recorded_at=recorded_at,
+            zone_offset=raw_workout.timezone_offset,
             components=components or None,
         )
 
