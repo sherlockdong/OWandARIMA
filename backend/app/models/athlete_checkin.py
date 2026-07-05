@@ -1,11 +1,11 @@
-from sqlalchemy.orm._orm_constructors import mapped_column
+from sqlalchemy.orm import Mapped, mapped_column
 from uuid import UUID
 
 from sqlalchemy import CheckConstraint
-from sqlalchemy.orm import Mapped
 from app.database import BaseDbModel
 from app.mappings import FKUser, PrimaryKey, str_32, str_255
 from app.mappings import FKPerformanceEvent
+
 
 class AthleteCheckin(BaseDbModel):
     __tablename__ = "athlete_checkin"
@@ -35,7 +35,6 @@ class AthleteCheckin(BaseDbModel):
             "soreness_rating BETWEEN 1 AND 10",
             name="ck_athlete_checkin_soreness",
         ),
-        
     )
 
     id: Mapped[PrimaryKey[UUID]]
@@ -52,4 +51,3 @@ class AthleteCheckin(BaseDbModel):
     soreness_rating: Mapped[int]
 
     performance_event_id: Mapped[FKPerformanceEvent | None] = mapped_column(default=None)
-
