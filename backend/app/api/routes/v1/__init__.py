@@ -3,6 +3,7 @@ from fastapi import APIRouter
 from .api_keys import router as api_keys_router
 from .applications import router as applications_router
 from .archival import router as archival_router
+from .athlete_checkins import router as athlete_checkins_router
 from .auth import router as auth_router
 from .connections import router as connections_router
 from .dashboard import router as dashboard_router
@@ -74,5 +75,8 @@ v1_router.include_router(
     providers_webhooks_router, prefix="/providers/{provider}/webhooks", tags=["System: Provider Webhooks"]
 )
 v1_router.include_router(deprecated_webhooks_router, tags=["System: Provider Webhooks (Deprecated)"], deprecated=True)
-
+v1_router.include_router(
+    athlete_checkins_router,
+    tags=["Internal: Athlete Readiness"],
+)
 __all__ = ["v1_router"]

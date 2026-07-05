@@ -18,6 +18,7 @@ import {
   Ellipsis,
   Heart,
   type LucideIcon,
+  Brain,
 } from 'lucide-react';
 import {
   useUser,
@@ -26,6 +27,7 @@ import {
   useGenerateInvitationCode,
 } from '@/hooks/api/use-users';
 import { useUserDataSummary } from '@/hooks/api/use-health';
+import { ReadinessSection } from '@/components/user/readiness-section';
 import { ROUTES } from '@/lib/constants/routes';
 import { API_CONFIG } from '@/lib/api/config';
 import { copyToClipboard } from '@/lib/utils/clipboard';
@@ -179,6 +181,13 @@ function UserDetailPage() {
           />
         ),
       },
+      {
+        id: 'readiness',
+        label: 'Readiness',
+        icon: Brain,
+        content: <ReadinessSection userId={userId} />,
+      },
+
       ...(dataSummary?.has_womens_health_data
         ? [
             {

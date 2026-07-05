@@ -14,6 +14,7 @@ from .personal_record import PersonalRecord
 from .provider_priority import ProviderPriority
 from .provider_setting import ProviderSetting
 from .refresh_token import RefreshToken
+from .athlete_checkin import AthleteCheckin
 from .series_type_definition import SeriesTypeDefinition
 from .menstrual_cycle_details import MenstrualCycleDetails
 from .sleep_details import SleepDetails
@@ -21,8 +22,10 @@ from .user import User
 from .user_connection import UserConnection
 from .user_invitation_code import UserInvitationCode
 from .workout_details import WorkoutDetails
+from .performance_event import PerformanceEvent, PerformanceMetricDefinition, PerformanceMetricValue
 
 __all__ = [
+    "AthleteCheckin",
     "ApiKey",
     "Application",
     "ArchivalSetting",
@@ -47,3 +50,4 @@ __all__ = [
     "SeriesTypeDefinition",
     "HealthScore",
 ]
+from .athlete_daily_feature import AthleteDailyFeature
