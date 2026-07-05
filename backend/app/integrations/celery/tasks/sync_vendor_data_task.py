@@ -13,6 +13,9 @@ from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.auth import LiveSyncMode
 from app.schemas.responses.upload import ProviderSyncResult, SyncVendorDataResult
 from app.schemas.sync_status import SyncSource, SyncStage, SyncStatus
+from app.services.athlete_daily_feature_service import (
+    athlete_daily_feature_service,
+)
 from app.services.providers.factory import ProviderFactory
 from app.services.sync_coordination import release_primary, release_stale_primary, try_become_primary
 from app.services.sync_status_service import completed, failed, new_run_id, progress, started
@@ -48,6 +51,26 @@ def _include_in_periodic_pull(caps: Any, live_sync_mode: LiveSyncMode | None, is
     if is_historical:
         return True
     return live_sync_mode == LiveSyncMode.PULL
+
+
+def _rebuild_daily_features_after_sync(
+    db: Any,
+    user_id: UUID,
+    start_at: datetime,
+    end_at: datetime,
+) -> dict[str, Any]:
+    rows = athlete_daily_feature_service.rebuild_for_source_window(
+        db,
+        user_id,
+        start_at,
+        end_at,
+    )
+    return {
+        "success": True,
+        "rows_rebuilt": len(rows),
+        "start_at": start_at.isoformat(),
+        "end_at": end_at.isoformat(),
+    }
 
 
 @shared_task
@@ -282,6 +305,12 @@ def sync_vendor_data(
                             # First ever sync — start from now, historical must be explicit
                             effective_start = datetime.now(timezone.utc).isoformat()
 
+                    sync_start_dt = datetime.fromisoformat(effective_start.replace("Z", "+00:00"))
+                    sync_end_dt = datetime.now(timezone.utc)
+                    if end_date:
+                        with suppress(ValueError):
+                            sync_end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+
                     # Sync workouts
                     if strategy.workouts:
                         params = _build_sync_params(provider_name, effective_start, end_date)
@@ -324,13 +353,6 @@ def sync_vendor_data(
                         # Determine if this is first sync (for API compatibility with providers)
                         is_first_sync = connection.last_synced_at is None
 
-                        # effective_start is always set above; parse into datetime objects
-                        start_dt = datetime.fromisoformat(effective_start.replace("Z", "+00:00"))
-                        end_dt = datetime.now(timezone.utc)
-                        if end_date:
-                            with suppress(ValueError):
-                                end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-
                         _emit_sync_status(
                             progress,
                             user_uuid,
@@ -349,8 +371,8 @@ def sync_vendor_data(
                                 results_247 = provider_any.load_and_save_all(
                                     db,
                                     user_uuid,
-                                    start_time=start_dt,
-                                    end_time=end_dt,
+                                    start_time=sync_start_dt,
+                                    end_time=sync_end_dt,
                                     is_first_sync=is_first_sync,
                                 )
                                 provider_result.params["data_247"] = {"success": True, "saved": True, **results_247}
@@ -361,8 +383,8 @@ def sync_vendor_data(
                                 results_247 = strategy.data_247.load_all_247_data(
                                     db,
                                     user_uuid,
-                                    start_time=start_dt,
-                                    end_time=end_dt,
+                                    start_time=sync_start_dt,
+                                    end_time=sync_end_dt,
                                 )
                                 provider_result.params["data_247"] = {"success": True, "saved": False, **results_247}
                             log_structured(
@@ -468,6 +490,30 @@ def sync_vendor_data(
                             metadata={"is_historical": is_historical, "params": provider_result.params},
                         )
                     else:
+                        try:
+                            feature_result = _rebuild_daily_features_after_sync(
+                                db,
+                                user_uuid,
+                                sync_start_dt,
+                                sync_end_dt,
+                            )
+                        except Exception as feature_error:
+                            db.rollback()
+                            log_structured(
+                                logger,
+                                "warning",
+                                (f"Athlete daily feature rebuild failed after {provider_name} sync: {feature_error}"),
+                                provider=provider_name,
+                                task="sync_vendor_data",
+                                user_id=user_id,
+                            )
+                            feature_result = {
+                                "success": False,
+                                "error": str(feature_error),
+                            }
+
+                        provider_result.params["athlete_daily_features"] = feature_result
+
                         # inserted/updated are run-level totals across all timeseries
                         # types: a single sync (historical included) can have both —
                         # e.g. new days inserted while overlapping days are refreshed.

@@ -21,6 +21,7 @@ from app.schemas.enums import HealthScoreCategory, SeriesType, get_series_type_i
 _OFFSET_PATTERN = re.compile(r"^([+-])(\d{2}):(\d{2})$")
 _MAX_TIMEZONE_SHIFT = timedelta(hours=14)
 _BASELINE_LOOKBACK_DAYS = 28
+_BASELINE_PROPAGATION_DAYS = 28
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +31,7 @@ class _MetricObservation:
     zone_offset: str
     record_id: str
     provider: str
+    priority: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +75,39 @@ class _DailySnapshot:
 class AthleteDailyFeatureService:
     """Aggregate normalized source records into one feature row per local day."""
 
+    def rebuild_for_source_window(
+        self,
+        db: Session,
+        user_id: UUID,
+        source_start: datetime,
+        source_end: datetime,
+        *,
+        through_date: date | None = None,
+    ) -> list[AthleteDailyFeature]:
+        """Rebuild dates affected by a changed source timestamp window."""
+        source_start_utc = self._as_utc(source_start)
+        source_end_utc = self._as_utc(source_end)
+
+        if source_end_utc < source_start_utc:
+            raise ValueError("source_end must be on or after source_start")
+
+        rebuild_start = (source_start_utc - _MAX_TIMEZONE_SHIFT).date()
+        last_source_date = (source_end_utc + _MAX_TIMEZONE_SHIFT).date()
+        rebuild_end = last_source_date + timedelta(days=_BASELINE_PROPAGATION_DAYS)
+
+        maximum_date = through_date if through_date is not None else datetime.now(timezone.utc).date()
+        rebuild_end = min(rebuild_end, maximum_date)
+
+        if rebuild_end < rebuild_start:
+            rebuild_end = rebuild_start
+
+        return self.rebuild_range(
+            db,
+            user_id,
+            rebuild_start,
+            rebuild_end,
+        )
+
     def rebuild_range(
         self,
         db: Session,
@@ -115,7 +150,18 @@ class AthleteDailyFeatureService:
         computed_at = datetime.now(timezone.utc)
         rows_to_upsert: list[dict[str, Any]] = []
 
-        for day in self._date_range(start_date, end_date):
+        feature_start_date = start_date
+        feature_end_date = end_date
+        source_dates = [day for day in state.buckets if start_date <= day <= end_date]
+
+        if source_dates:
+            feature_start_date = max(start_date, min(source_dates))
+            feature_end_date = min(end_date, max(source_dates))
+
+        for day in self._date_range(
+            feature_start_date,
+            feature_end_date,
+        ):
             snapshot = snapshots[day]
 
             hrv_7d, hrv_7d_count = self._prior_mean(
@@ -230,8 +276,8 @@ class AthleteDailyFeatureService:
             select(AthleteDailyFeature)
             .where(
                 AthleteDailyFeature.user_id == user_id,
-                AthleteDailyFeature.local_date >= start_date,
-                AthleteDailyFeature.local_date <= end_date,
+                AthleteDailyFeature.local_date >= feature_start_date,
+                AthleteDailyFeature.local_date <= feature_end_date,
             )
             .order_by(AthleteDailyFeature.local_date)
         ).all()
@@ -289,8 +335,13 @@ class AthleteDailyFeatureService:
         maximum_local_date: date,
         state: _AggregationState,
     ) -> None:
-        scores = db.scalars(
-            select(HealthScore).where(
+        rows = db.execute(
+            select(HealthScore, EventRecord)
+            .outerjoin(
+                EventRecord,
+                HealthScore.sleep_record_id == EventRecord.id,
+            )
+            .where(
                 HealthScore.user_id == user_id,
                 HealthScore.recorded_at >= query_start,
                 HealthScore.recorded_at < query_end,
@@ -303,7 +354,7 @@ class AthleteDailyFeatureService:
             )
         ).all()
 
-        for score in scores:
+        for score, linked_sleep in rows:
             if score.category == HealthScoreCategory.RECOVERY:
                 metric_name = "recovery_score"
             elif score.category == HealthScoreCategory.STRAIN and score.qualifier == "cycle":
@@ -314,13 +365,19 @@ class AthleteDailyFeatureService:
             if score.value is None:
                 continue
 
+            source_timestamp = score.recorded_at
             zone_offset = score.zone_offset
+
+            if metric_name == "recovery_score" and linked_sleep is not None and linked_sleep.zone_offset is not None:
+                source_timestamp = linked_sleep.end_datetime
+                zone_offset = linked_sleep.zone_offset
+
             if zone_offset is None:
                 state.missing_timezone[metric_name] += 1
                 continue
 
             local_day = self._local_date(
-                score.recorded_at,
+                source_timestamp,
                 zone_offset,
             )
             if local_day is None:
@@ -329,17 +386,59 @@ class AthleteDailyFeatureService:
             if not minimum_local_date <= local_day <= maximum_local_date:
                 continue
 
+            provider = self._provider_value(score.provider)
+            recorded_at = self._as_utc(source_timestamp)
+            bucket = state.buckets.setdefault(
+                local_day,
+                _DailyBucket(),
+            )
+
             observation = _MetricObservation(
                 value=float(score.value),
-                recorded_at=self._as_utc(score.recorded_at),
+                recorded_at=recorded_at,
                 zone_offset=zone_offset,
                 record_id=str(score.id),
-                provider=self._provider_value(score.provider),
+                provider=provider,
             )
-            bucket = state.buckets.setdefault(local_day, _DailyBucket())
 
             if metric_name == "recovery_score":
                 bucket.recovery.append(observation)
+
+                component_targets = (
+                    (
+                        "hrv_rmssd_milli",
+                        "hrv_rmssd_ms",
+                        bucket.hrv,
+                    ),
+                    (
+                        "resting_heart_rate",
+                        "resting_heart_rate_bpm",
+                        bucket.resting_hr,
+                    ),
+                )
+
+                for (
+                    component_name,
+                    coverage_name,
+                    target,
+                ) in component_targets:
+                    component_value = self._component_value(
+                        score.components,
+                        component_name,
+                    )
+                    if component_value is None:
+                        continue
+
+                    target.append(
+                        _MetricObservation(
+                            value=component_value,
+                            recorded_at=recorded_at,
+                            zone_offset=zone_offset,
+                            record_id=(f"{score.id}:{component_name}"),
+                            provider=provider,
+                            priority=1,
+                        )
+                    )
             else:
                 bucket.strain.append(observation)
 
@@ -575,6 +674,25 @@ class AthleteDailyFeatureService:
         )
 
     @staticmethod
+    def _component_value(
+        components: dict[str, Any] | None,
+        component_name: str,
+    ) -> float | None:
+        if not components:
+            return None
+
+        component = components.get(component_name)
+        if component is None:
+            return None
+
+        value = component.get("value") if isinstance(component, dict) else getattr(component, "value", None)
+
+        if value is None:
+            return None
+
+        return float(value)
+
+    @staticmethod
     def _metric_coverage(
         observations: list[_MetricObservation],
         selected: _MetricObservation | None,
@@ -594,7 +712,11 @@ class AthleteDailyFeatureService:
             return None
         return max(
             observations,
-            key=lambda item: (item.recorded_at, item.record_id),
+            key=lambda item: (
+                item.priority,
+                item.recorded_at,
+                item.record_id,
+            ),
         )
 
     @staticmethod

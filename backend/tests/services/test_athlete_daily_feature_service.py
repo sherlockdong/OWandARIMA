@@ -2,13 +2,16 @@
 
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from uuid import UUID
 
+import pytest
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models.athlete_daily_feature import AthleteDailyFeature
 from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.services.athlete_daily_feature_service import (
+    AthleteDailyFeatureService,
     athlete_daily_feature_service,
 )
 from tests.factories import (
@@ -423,3 +426,108 @@ def test_rebuild_is_idempotent(db: Session) -> None:
     )
 
     assert row_count == 1
+
+
+def test_recovery_components_use_linked_sleep_wake_date(
+    db: Session,
+) -> None:
+    user = UserFactory()
+    data_source = DataSourceFactory(
+        user=user,
+        provider=ProviderName.WHOOP,
+        source="whoop",
+        device_model="Whoop",
+    )
+    sleep_record = EventRecordFactory(
+        data_source=data_source,
+        category="sleep",
+        type="sleep_session",
+        source_name="Whoop",
+        start_datetime=datetime(
+            2026,
+            7,
+            4,
+            19,
+            tzinfo=timezone.utc,
+        ),
+        end_datetime=datetime(
+            2026,
+            7,
+            5,
+            3,
+            tzinfo=timezone.utc,
+        ),
+        duration_seconds=28_800,
+        zone_offset="-04:00",
+    )
+    SleepDetailsFactory(
+        event_record=sleep_record,
+        sleep_total_duration_minutes=450,
+        sleep_time_in_bed_minutes=480,
+        sleep_efficiency_score=Decimal("92"),
+        is_nap=False,
+    )
+    HealthScoreFactory(
+        data_source=data_source,
+        user_id=user.id,
+        provider=ProviderName.WHOOP,
+        category=HealthScoreCategory.RECOVERY,
+        value=Decimal("82"),
+        recorded_at=datetime(
+            2026,
+            7,
+            5,
+            12,
+            tzinfo=timezone.utc,
+        ),
+        zone_offset="-04:00",
+        sleep_record_id=sleep_record.id,
+        components={
+            "hrv_rmssd_milli": {"value": 61.25},
+            "resting_heart_rate": {"value": 49},
+        },
+    )
+
+    rows = athlete_daily_feature_service.rebuild_range(
+        db,
+        user.id,
+        date(2026, 7, 4),
+        date(2026, 7, 5),
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.local_date == date(2026, 7, 4)
+    assert row.recovery_score == 82
+    assert row.hrv_rmssd_ms == 61.25
+    assert row.resting_heart_rate_bpm == 49
+
+
+def test_source_window_propagates_baseline_rebuild(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = AthleteDailyFeatureService()
+    captured = {}
+
+    def fake_rebuild(
+        _db: object,
+        _user_id: UUID,
+        start_date: date,
+        end_date: date,
+    ) -> list[object]:
+        captured["start_date"] = start_date
+        captured["end_date"] = end_date
+        return []
+
+    monkeypatch.setattr(service, "rebuild_range", fake_rebuild)
+
+    service.rebuild_for_source_window(
+        object(),
+        UserFactory.build().id,
+        datetime(2026, 6, 1, 12, tzinfo=timezone.utc),
+        datetime(2026, 6, 2, 12, tzinfo=timezone.utc),
+        through_date=date(2026, 7, 10),
+    )
+
+    assert captured["start_date"] == date(2026, 5, 31)
+    assert captured["end_date"] == date(2026, 7, 1)
